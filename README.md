@@ -1,8 +1,13 @@
 Specification: Adaptive Observability Negotiation (AON)
+
 Status: Draft / Experimental
+
 Version: 1.0.0
+
 Context: Full Agent Stack Initiative
+
 Pattern Type: Architectural / Communication Protocol
+
 
 1. Abstract
 O padrão Adaptive Observability Negotiation (AON) define um mecanismo arquitetural para APIs RESTful que permite ao cliente negociar dinamicamente o nível de observabilidade da resposta.
