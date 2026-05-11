@@ -1,9 +1,11 @@
 const http = require('http');
 const { URL } = require('url');
+const crypto = require('crypto');
 
 // ---- Utilities ----
 const USERS = new Map();
 let NEXT_ID = 1;
+const PORT = process.env.PORT || 3000;
 
 const DICTIONARY = {
   pagination: {
@@ -372,12 +374,169 @@ function handleDelete(req, res, aon, id) {
   return aon.finalize({ success: true });
 }
 
+// ---- WebSocket (developer coaching) ----
+const WS_CLIENTS = new Set();
+
+function encodeWsFrame(message) {
+  const payload = Buffer.from(typeof message === 'string' ? message : JSON.stringify(message));
+  if (payload.length >= 126) throw new Error('Frame too large for simple encoder');
+  const frame = Buffer.alloc(2 + payload.length);
+  frame[0] = 0x81; // FIN + text frame
+  frame[1] = payload.length; // no masking from server
+  payload.copy(frame, 2);
+  return frame;
+}
+
+function decodeWsFrame(buffer) {
+  const isMasked = (buffer[1] & 0x80) === 0x80;
+  let length = buffer[1] & 0x7f;
+  let offset = 2;
+
+  if (length === 126) {
+    length = buffer.readUInt16BE(offset);
+    offset += 2;
+  }
+
+  let mask;
+  if (isMasked) {
+    mask = buffer.slice(offset, offset + 4);
+    offset += 4;
+  }
+
+  const payload = buffer.slice(offset, offset + length);
+  if (isMasked && mask) {
+    for (let i = 0; i < payload.length; i++) {
+      payload[i] ^= mask[i % 4];
+    }
+  }
+
+  return payload.toString('utf8');
+}
+
+function attachDeveloperWebSocket(serverInstance) {
+  serverInstance.on('upgrade', (req, socket) => {
+    const pathname = req.url.split('?')[0];
+    if (pathname !== '/dev-ws') return socket.destroy();
+
+    const key = req.headers['sec-websocket-key'];
+    if (!key) return socket.destroy();
+
+    const acceptKey = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    const headers = [
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${acceptKey}`,
+      '\r\n'
+    ];
+    socket.write(headers.join('\r\n'));
+
+    const session = { attempt: 0 };
+    WS_CLIENTS.add(socket);
+
+    const send = (payload) => {
+      try {
+        socket.write(encodeWsFrame(payload));
+      } catch (err) {
+        socket.destroy();
+      }
+    };
+
+    const prompt = () => {
+      const nextAttempt = session.attempt + 1;
+      send({ type: 'prompt', attempt: nextAttempt, message: `Envie um JSON com name/email (tentativa ${nextAttempt}/3)` });
+    };
+
+    prompt();
+
+    socket.on('data', async (chunk) => {
+      if (!chunk.length) return;
+      const text = decodeWsFrame(chunk);
+      session.attempt += 1;
+
+      let payload;
+      try {
+        payload = JSON.parse(text);
+      } catch (err) {
+        payload = { name: '', email: text.trim() };
+      }
+
+      try {
+        const result = await postThroughApi(payload);
+        const success = result.status < 400;
+        send({
+          type: 'attempt_result',
+          attempt: session.attempt,
+          status: result.status,
+          ok: success,
+          body: result.body,
+          aonReport: result.aonReport
+        });
+
+        if (success || session.attempt >= 3) {
+          send({
+            type: 'completed',
+            ok: success,
+            headerReport: result.aonReport,
+            message: success ? 'Valor aceito pela API; relatório AON devolvido no cabeçalho.' : 'Limite de tentativas atingido sem sucesso.'
+          });
+          setTimeout(() => socket.end(), 50);
+        } else {
+          prompt();
+        }
+      } catch (err) {
+        send({ type: 'error', message: err.message });
+        setTimeout(() => socket.end(), 50);
+      }
+    });
+
+    socket.on('end', () => WS_CLIENTS.delete(socket));
+    socket.on('close', () => WS_CLIENTS.delete(socket));
+    socket.on('error', () => WS_CLIENTS.delete(socket));
+  });
+}
+
+function postThroughApi(payload) {
+  const port = server.address().port || PORT;
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const req = http.request(
+      {
+        method: 'POST',
+        port,
+        host: '127.0.0.1',
+        path: '/user',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => {
+          let parsed = {};
+          try {
+            parsed = data ? JSON.parse(data) : {};
+          } catch (err) {
+            parsed = { parseError: err.message, raw: data };
+          }
+          resolve({ status: res.statusCode || 0, body: parsed, aonReport: res.headers['x-aon-report'] });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 // ---- Server ----
 const server = http.createServer(handleRequest);
+attachDeveloperWebSocket(server);
 
-const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`AON User API listening on port ${PORT}`);
 });
 
-module.exports = { server, parseIntentQuery, healKey, parseValue, setDeep, createAon, normalizeRoute };
+module.exports = { server, parseIntentQuery, healKey, parseValue, setDeep, createAon, normalizeRoute, attachDeveloperWebSocket };
